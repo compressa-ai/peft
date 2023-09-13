@@ -36,6 +36,7 @@ from ..utils import (
     _get_submodules,
     transpose,
 )
+from awq.quantize.qmodule import WQLinear
 
 
 if is_bnb_available():
@@ -247,6 +248,7 @@ class LoraModel(torch.nn.Module):
         loaded_in_4bit = getattr(self.model, "is_loaded_in_4bit", False)
         loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
 
+        wqlinear = False
         if loaded_in_8bit and isinstance(target, bnb.nn.Linear8bitLt):
             eightbit_kwargs = kwargs.copy()
             eightbit_kwargs.update(
@@ -301,12 +303,32 @@ class LoraModel(torch.nn.Module):
                         "Setting fan_in_fan_out to True."
                     )
                     kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = True
+            elif isinstance(target, WQLinear):
+                in_features, out_features = target.in_features, target.out_features
+                if kwargs["fan_in_fan_out"]:
+                    warnings.warn(
+                        "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
+                        "Setting fan_in_fan_out to False."
+                    )
+                    kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
+                wqlinear = True
             else:
                 raise ValueError(
                     f"Target module {target} is not supported. "
                     f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
                 )
-            new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
+            if not wqlinear:
+                new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
+            else:
+                # new_module = WQLinearLora(adapter_name, in_features, out_features, bias=bias, **kwargs)
+                new_module = WQLinearLora.from_WQLinear(target, adapter_name,
+                                                        w_bit=target.w_bit, 
+                                                        group_size=target.group_size,
+                                                        in_features=target.in_features,
+                                                        out_features=target.out_features,
+                                                        bias=target.bias,
+                                                        dev=target.qweight.device,
+                                                        **kwargs)
 
         return new_module
 
@@ -360,7 +382,8 @@ class LoraModel(torch.nn.Module):
 
     def _replace_module(self, parent_module, child_name, new_module, old_module):
         setattr(parent_module, child_name, new_module)
-        new_module.weight = old_module.weight
+        if hasattr(old_module, "weight"):
+            new_module.weight = old_module.weight
         if hasattr(old_module, "bias"):
             if old_module.bias is not None:
                 new_module.bias = old_module.bias
@@ -372,9 +395,15 @@ class LoraModel(torch.nn.Module):
         # dispatch to correct device
         for name, module in new_module.named_modules():
             if "lora_" in name:
-                module.to(old_module.weight.device)
+                if hasattr(old_module, "weight"):
+                    module.to(old_module.weight.device)
+                if hasattr(old_module, "qweight"):
+                    module.to(old_module.qweight.device)
             if "ranknum" in name:
-                module.to(old_module.weight.device)
+                if hasattr(old_module, "weight"):
+                    module.to(old_module.weight.device)
+                if hasattr(old_module, "qweight"):
+                    module.to(old_module.qweight.device)
 
     def __getattr__(self, name: str):
         """Forward missing attributes to the wrapped module."""
@@ -688,7 +717,10 @@ class LoraLayer:
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
-        self.to(self.weight.device)
+        if hasattr(self, "weight"):
+            self.to(self.weight.device)
+        if hasattr(self, "qweight"):
+            self.to(self.qweight.device)
 
     def update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
         self.r[adapter_name] = r
@@ -744,6 +776,110 @@ class LoraLayer:
             # initialize a the same way as the default for nn.linear and b to zero
             nn.init.zeros_(self.lora_embedding_A[adapter_name])
             nn.init.normal_(self.lora_embedding_B[adapter_name])
+
+
+class WQLinearLora(WQLinear, LoraLayer):
+    # Lora implemented in a dense layer
+    def __init__(
+        self,
+        w_bit, group_size, bias, dev,
+        adapter_name: str,
+        in_features: int,
+        out_features: int,
+        r: int = 0,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.0,
+        fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        is_target_conv_1d_layer: bool = False,
+        **kwargs,
+    ):
+        init_lora_weights = kwargs.pop("init_lora_weights", True)
+
+        WQLinear.__init__(self, w_bit, group_size, in_features, out_features, bias, dev)
+        # nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
+        # Freezing the pre-trained weight matrix
+        # self.weight.requires_grad = False
+
+        self.fan_in_fan_out = fan_in_fan_out
+        if fan_in_fan_out:
+            self.qweight.data = self.qweight.data.T
+
+        # nn.Linear.reset_parameters(self)
+        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+        self.active_adapter = adapter_name
+        self.is_target_conv_1d_layer = is_target_conv_1d_layer
+
+    def merge(self):
+        if self.active_adapter not in self.lora_A.keys():
+            return
+        if self.merged:
+            warnings.warn("Already merged. Nothing to do.")
+            return
+        if self.r[self.active_adapter] > 0:
+            self.weight.data += self.get_delta_weight(self.active_adapter)
+            self.merged = True
+
+    def unmerge(self):
+        if self.active_adapter not in self.lora_A.keys():
+            return
+        if not self.merged:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+        if self.r[self.active_adapter] > 0:
+            self.weight.data -= self.get_delta_weight(self.active_adapter)
+            self.merged = False
+
+    def get_delta_weight(self, adapter):
+        return (
+            transpose(
+                self.lora_B[adapter].weight @ self.lora_A[adapter].weight,
+                self.fan_in_fan_out,
+            )
+            * self.scaling[adapter]
+        )
+
+    def forward(self, x: torch.Tensor):
+        previous_dtype = x.dtype
+        if self.active_adapter not in self.lora_A.keys():
+            return super(WQLinearLora, self).forward(x)
+        if self.disable_adapters:
+            if self.r[self.active_adapter] > 0 and self.merged:
+                self.unmerge()
+            return super(WQLinearLora, self).forward(x)
+        elif self.r[self.active_adapter] > 0 and not self.merged:
+            result = super(WQLinearLora, self).forward(x)
+
+            x = x.to(self.lora_A[self.active_adapter].weight.dtype)
+
+            result += (
+                self.lora_B[self.active_adapter](
+                    self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
+                )
+                * self.scaling[self.active_adapter]
+            )
+        else:
+            result = super(WQLinearLora, self)(x)
+
+        result = result.to(previous_dtype)
+
+        return result
+
+    @classmethod
+    def from_WQLinear(cls, linear, adapter_name, w_bit, group_size, in_features, out_features, bias, dev, **kwargs):
+        awq_linear = WQLinearLora(w_bit=linear.w_bit, 
+                                  group_size=linear.group_size,
+                         in_features=linear.in_features, out_features=linear.out_features, 
+                         bias=linear.bias is not None, dev=linear.qweight.device,
+                         adapter_name=adapter_name, **kwargs)
+        awq_linear.scales = linear.scales.clone().half()
+        if linear.bias is not None:
+            awq_linear.bias = linear.bias.clone().half()
+        awq_linear.qweight = linear.qweight.clone()
+        awq_linear.qzeros = linear.qzeros.clone()
+        awq_linear.qweight.requires_grad = False
+
+        return awq_linear
 
 
 class Linear(nn.Linear, LoraLayer):
