@@ -324,9 +324,9 @@ class LoraModel(torch.nn.Module):
                 new_module = WQLinearLora.from_WQLinear(target, adapter_name,
                                                         w_bit=target.w_bit, 
                                                         group_size=target.group_size,
-                                                        in_features=target.in_features,
-                                                        out_features=target.out_features,
-                                                        bias=target.bias,
+                                                        in_features=in_features,
+                                                        out_features=out_features,
+                                                        bias=bias,
                                                         dev=target.qweight.device,
                                                         **kwargs)
 
@@ -790,79 +790,50 @@ class WQLinearLora(WQLinear, LoraLayer):
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        is_target_conv_1d_layer: bool = False,
         **kwargs,
     ):
-        init_lora_weights = kwargs.pop("init_lora_weights", True)
-
         WQLinear.__init__(self, w_bit, group_size, in_features, out_features, bias, dev)
         # nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
-        # self.weight.requires_grad = False
+        self.qweight.requires_grad = False
+        self.qzeros.requires_grad = False
+        self.scales.requires_grad = False
+        if bias:
+            self.bias.requires_grad = False
 
         self.fan_in_fan_out = fan_in_fan_out
         if fan_in_fan_out:
             self.qweight.data = self.qweight.data.T
 
-        # nn.Linear.reset_parameters(self)
+        init_lora_weights = kwargs.pop("init_lora_weights", True)
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
-        self.is_target_conv_1d_layer = is_target_conv_1d_layer
-
-    def merge(self):
-        if self.active_adapter not in self.lora_A.keys():
-            return
-        if self.merged:
-            warnings.warn("Already merged. Nothing to do.")
-            return
-        if self.r[self.active_adapter] > 0:
-            self.weight.data += self.get_delta_weight(self.active_adapter)
-            self.merged = True
-
-    def unmerge(self):
-        if self.active_adapter not in self.lora_A.keys():
-            return
-        if not self.merged:
-            warnings.warn("Already unmerged. Nothing to do.")
-            return
-        if self.r[self.active_adapter] > 0:
-            self.weight.data -= self.get_delta_weight(self.active_adapter)
-            self.merged = False
-
-    def get_delta_weight(self, adapter):
-        return (
-            transpose(
-                self.lora_B[adapter].weight @ self.lora_A[adapter].weight,
-                self.fan_in_fan_out,
-            )
-            * self.scaling[adapter]
-        )
 
     def forward(self, x: torch.Tensor):
-        previous_dtype = x.dtype
-        if self.active_adapter not in self.lora_A.keys():
-            return super(WQLinearLora, self).forward(x)
-        if self.disable_adapters:
-            if self.r[self.active_adapter] > 0 and self.merged:
-                self.unmerge()
-            return super(WQLinearLora, self).forward(x)
-        elif self.r[self.active_adapter] > 0 and not self.merged:
-            result = super(WQLinearLora, self).forward(x)
+        result = super().forward(x)
 
-            x = x.to(self.lora_A[self.active_adapter].weight.dtype)
-
-            result += (
-                self.lora_B[self.active_adapter](
-                    self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
+        if self.disable_adapters or self.active_adapter not in self.lora_A.keys():
+            return result
+        elif self.r[self.active_adapter] > 0:
+            result = result.clone()
+            if not torch.is_autocast_enabled():
+                expected_dtype = result.dtype
+                x = x.to(self.lora_A[self.active_adapter].weight.dtype)
+                output = (
+                    self.lora_B[self.active_adapter](
+                        self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
+                    ).to(expected_dtype)
+                    * self.scaling[self.active_adapter]
                 )
-                * self.scaling[self.active_adapter]
-            )
-        else:
-            result = super(WQLinearLora, self)(x)
-
-        result = result.to(previous_dtype)
-
+            else:
+                output = (
+                    self.lora_B[self.active_adapter](
+                        self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
+                    )
+                    * self.scaling[self.active_adapter]
+                )
+            result += output
         return result
 
     @classmethod
@@ -877,7 +848,12 @@ class WQLinearLora(WQLinear, LoraLayer):
             awq_linear.bias = linear.bias.clone().half()
         awq_linear.qweight = linear.qweight.clone()
         awq_linear.qzeros = linear.qzeros.clone()
+        # Freezing the pre-trained weight matrix
         awq_linear.qweight.requires_grad = False
+        awq_linear.qzeros.requires_grad = False
+        awq_linear.scales.requires_grad = False
+        if bias:
+            awq_linear.bias.requires_grad = False
 
         return awq_linear
 
